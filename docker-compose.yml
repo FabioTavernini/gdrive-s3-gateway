@@ -1,0 +1,15 @@
+services:
+  gdrive-s3-gateway:
+    build: .
+    image: gdrive-s3-gateway:local
+    ports:
+      - "8080:8080"
+    environment:
+      RCLONE_REMOTE: "drive:"
+      RCLONE_S3_ACCESS_KEY_ID: ${RCLONE_S3_ACCESS_KEY_ID:?set in .env, see readme.md}
+      RCLONE_S3_SECRET_ACCESS_KEY: ${RCLONE_S3_SECRET_ACCESS_KEY:?set in .env, see readme.md}
+      RCLONE_EXTRA_ARGS: ${RCLONE_EXTRA_ARGS:-}
+    volumes:
+      # Produced locally via `rclone config` (milestone 1) — never commit this file.
+      - ./rclone.conf:/config/rclone/rclone.conf:ro
+    restart: unless-stopped

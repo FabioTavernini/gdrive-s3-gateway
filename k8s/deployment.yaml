@@ -1,0 +1,64 @@
+apiVersion: apps/v1
+kind: Deployment
+metadata:
+  name: gdrive-s3-gateway
+  labels:
+    app: gdrive-s3-gateway
+spec:
+  replicas: 1
+  strategy:
+    type: Recreate # single pod, no rolling overlap against the same Drive remote
+  selector:
+    matchLabels:
+      app: gdrive-s3-gateway
+  template:
+    metadata:
+      labels:
+        app: gdrive-s3-gateway
+    spec:
+      containers:
+        - name: gateway
+          image: ghcr.io/FabioTavernini/gdrive-s3-gateway:latest
+          ports:
+            - containerPort: 8080
+              name: s3
+          env:
+            - name: RCLONE_REMOTE
+              value: "drive:"
+            - name: RCLONE_S3_ACCESS_KEY_ID
+              valueFrom:
+                secretKeyRef:
+                  name: gdrive-s3-gateway
+                  key: access-key-id
+            - name: RCLONE_S3_SECRET_ACCESS_KEY
+              valueFrom:
+                secretKeyRef:
+                  name: gdrive-s3-gateway
+                  key: secret-access-key
+          volumeMounts:
+            - name: rclone-config
+              mountPath: /config/rclone
+              readOnly: true
+          readinessProbe:
+            tcpSocket:
+              port: 8080
+            initialDelaySeconds: 5
+            periodSeconds: 10
+          livenessProbe:
+            tcpSocket:
+              port: 8080
+            initialDelaySeconds: 10
+            periodSeconds: 30
+          resources:
+            requests:
+              cpu: 50m
+              memory: 64Mi
+            limits:
+              memory: 256Mi
+      volumes:
+        - name: rclone-config
+          secret:
+            secretName: gdrive-s3-gateway
+            items:
+              - key: rclone.conf
+                path: rclone.conf
