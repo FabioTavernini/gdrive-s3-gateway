@@ -128,14 +128,79 @@ single-purpose service rather than written from scratch.
 
 ### 1. Create the Drive remote (milestone 1)
 
+#### 1a. Create a Google OAuth client
+
+rclone's built-in shared client ID works but shares its API quota with every
+other rclone user on the planet — create your own for anything beyond a
+quick toy test:
+
+1. [console.cloud.google.com](https://console.cloud.google.com) → create or
+   select a project.
+2. **APIs & Services → Library** → enable **Google Drive API**.
+3. **APIs & Services → OAuth consent screen** (may be under **Audience** in
+   newer Console layouts) → User type **External** → fill in app name +
+   your email → **Save**.
+4. Same page, **Test users** section → **+ Add users** → add your own
+   Google account. Skipping this gets you a hard **"Access blocked: app has
+   not completed verification"** screen instead of the normal "unverified
+   app" warning.
+5. **APIs & Services → Credentials → Create Credentials → OAuth client ID**
+   → Application type **Desktop app** → note the **Client ID** and
+   **Client Secret**.
+
+#### 1b. Run `rclone config`
+
 ```sh
-rclone config   # create a remote named "drive", type "drive"
-rclone lsd drive:
-rclone copy ./somefile.txt drive:test/
+rclone config
 ```
 
-This produces `~/.config/rclone/rclone.conf`. Copy it into the repo root as
-`rclone.conf` for local testing — it's gitignored, never commit it.
+Answers to give at each prompt:
+
+| Prompt | Answer |
+| --- | --- |
+| `n) New remote` | `n` |
+| name | `drive` |
+| Storage | `drive` (Google Drive) |
+| client_id | paste from 1a |
+| client_secret | paste from 1a |
+| scope | `drive.file` — "Access to files created by rclone only". Least-privilege, matches this project's one-folder-as-bucket design. Tradeoff: rclone can only see files/folders *it* created — a folder you made by hand in the Drive web UI won't be visible. |
+| root_folder_id | leave blank |
+| Edit advanced config | `n` |
+| Use auto config | `y` if this machine has a browser it can open; `n` on a headless box — it prints an `rclone authorize "drive"` command to run on a machine that does, then paste the JSON it gives back |
+| Configure as a Shared Drive (Team Drive) | `n` (unless you're actually using a Workspace Shared Drive) |
+| Keep this remote | `y` |
+
+This writes `~/.config/rclone/rclone.conf`. Copy it into the repo root as
+`rclone.conf` for local testing — it's gitignored, never commit it. **The
+`token` field in that file is a live credential** (access + refresh token)
+— treat the file like a password, and be careful not to paste its contents
+anywhere it'll be logged or persisted somewhere you don't control.
+
+#### 1c. Create the bucket folder and test
+
+Because we chose `drive.file` scope, the "bucket" folder has to be created
+*through rclone* — a pre-existing folder made in the Drive UI won't be
+visible to the app:
+
+```sh
+rclone mkdir drive:backups
+echo hello > /tmp/test.txt
+rclone copy /tmp/test.txt drive:backups/
+rclone ls drive:backups/
+```
+
+#### 1d. Switch off Testing mode before relying on this for real backups
+
+While the OAuth consent screen stays in **Testing** publishing status,
+Google caps refresh tokens for scopes like `drive.file` at **7 days** —
+nightly Velero/Longhorn backups would silently break a week in when the
+token stops working. Fix: **OAuth consent screen → Publishing status →
+Publish App** (moves it to Production) — no Google review needed for
+personal use at this scale, you'll just always see the "Google hasn't
+verified this app" warning on consent (click **Advanced → Go to
+gdrive-s3-gateway (unsafe)**). Redo step 1b's `rclone config` once after
+switching, so the token you end up with was issued after the switch and
+isn't under the 7-day cap.
 
 ### 2. Run the gateway locally (milestones 2 & 3)
 
@@ -154,15 +219,54 @@ Then, from another shell:
 ```sh
 export AWS_ACCESS_KEY_ID=devkey
 export AWS_SECRET_ACCESS_KEY=devsecret
-aws --endpoint-url http://localhost:8080 s3 mb s3://test
-aws --endpoint-url http://localhost:8080 s3 cp ./somefile.txt s3://test/
-aws --endpoint-url http://localhost:8080 s3 ls s3://test/
-aws --endpoint-url http://localhost:8080 s3 cp s3://test/somefile.txt ./roundtrip.txt
+# "backups" is the folder created via `rclone mkdir drive:backups` in step 1c
+aws --endpoint-url http://localhost:8080 s3 cp ./somefile.txt s3://backups/
+aws --endpoint-url http://localhost:8080 s3 ls s3://backups/
+aws --endpoint-url http://localhost:8080 s3 cp s3://backups/somefile.txt ./roundtrip.txt
 diff somefile.txt roundtrip.txt
-aws --endpoint-url http://localhost:8080 s3 rm s3://test/somefile.txt
+aws --endpoint-url http://localhost:8080 s3 rm s3://backups/somefile.txt
 ```
 
-### 3. Publish the image
+### 3. Load-test with s3tester (optional, but how the risks above were found)
+
+[s3tester](https://github.com/s3tester/s3tester) is what surfaced the
+read-after-write consistency findings in the Open Questions section above.
+It's not vendored in this repo — clone and build it separately:
+
+```sh
+git clone --depth 1 https://github.com/s3tester/s3tester.git
+cd s3tester && go build -o s3tester .
+```
+
+Then, with the gateway running (step 2) and your real key pair exported:
+
+```sh
+export AWS_ACCESS_KEY_ID=<RCLONE_S3_ACCESS_KEY_ID from .env>
+export AWS_SECRET_ACCESS_KEY=<RCLONE_S3_SECRET_ACCESS_KEY from .env>
+
+# burst of small concurrent PUTs — this is what exposed the visibility lag
+./s3tester -endpoint http://localhost:8080 -bucket backups \
+  -operation put -requests 20 -concurrency 4 -size 4096 \
+  -prefix loadtest -region us-east-1 -addressing-style path
+
+# multipart upload (simulates a large Velero backup tarball)
+./s3tester -endpoint http://localhost:8080 -bucket backups \
+  -operation multipartput -requests 1 -concurrency 1 \
+  -size 150MiB -partsize 10MiB \
+  -prefix loadtest-multipart -region us-east-1 -addressing-style path
+
+# always clean up afterwards — don't assume `delete` succeeding actually
+# removed a just-written object, see the DELETE no-op finding above; a
+# `list` a few seconds later is the only way to be sure the folder is clean
+./s3tester -endpoint http://localhost:8080 -bucket backups \
+  -operation delete -requests 20 -concurrency 4 \
+  -prefix loadtest -region us-east-1 -addressing-style path
+```
+
+Do **not** use plain `rclone copyto`/`rclone ls` against the gateway as a
+substitute for this — see the rclone-as-client false-negative finding above.
+
+### 4. Publish the image
 
 Pushing to `main` (or a `v*` tag) runs
 `.github/workflows/docker-publish.yml`, which builds and pushes the image to
@@ -170,7 +274,7 @@ Pushing to `main` (or a `v*` tag) runs
 registry credentials to set up. Make the package public under the repo's
 **Packages** settings if it needs to be pulled without auth.
 
-### 4. Run in-cluster (milestone 4)
+### 5. Run in-cluster (milestone 4)
 
 ```sh
 # real secret, not k8s/secret.example.yaml — see comments in that file
